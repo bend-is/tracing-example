@@ -26,6 +26,8 @@ const (
 )
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	var exporter *jaeger.Exporter
 	{
 		var err error
@@ -68,7 +70,7 @@ func main() {
 
 		ctx, span := trace.StartSpanWithRemoteParent(context.Background(), "server", sc)
 
-		doRedisStaff(redisPool, ctx)
+		doRedisStaff(ctx, redisPool)
 
 		rows, err := db.QueryContext(ctx, "select count(*) from test")
 		if err != nil {
@@ -95,7 +97,7 @@ func main() {
 		}
 		defer span.End()
 
-		if rand.Seed(time.Now().UnixNano()); rand.Intn(100) <= 20 {
+		if rand.Intn(100) <= 20 {
 			span.SetStatus(trace.Status{Code: 500, Message: "Internal Error"})
 			w.WriteHeader(500)
 			return
@@ -107,7 +109,7 @@ func main() {
 	http.ListenAndServe(":8080", nil)
 }
 
-func doRedisStaff(pool *redis.Pool, ctx context.Context) {
+func doRedisStaff(ctx context.Context, pool *redis.Pool) {
 	conn := pool.GetWithContext(ctx).(redis.ConnWithContext)
 	defer conn.CloseContext(ctx)
 
