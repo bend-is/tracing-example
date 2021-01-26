@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"contrib.go.opencensus.io/exporter/jaeger/propagation"
 
 	"contrib.go.opencensus.io/integrations/ocsql"
+	"github.com/opencensus-integrations/redigo/redis"
 	"go.opencensus.io/trace"
 
 	"github.com/lib/pq" // for pg driver
@@ -20,9 +22,12 @@ import (
 const (
 	envTracingHost = "http://localhost:14268/api/traces"
 	envPgConn      = "postgres://user:pass@localhost:9241/mydb?sslmode=disable"
+	envRedisHost   = "localhost:6380"
 )
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	var exporter *jaeger.Exporter
 	{
 		var err error
@@ -51,19 +56,39 @@ func main() {
 	cnn := ocsql.WrapConnector(connector, ocsql.WithAllTraceOptions())
 	db := sql.OpenDB(cnn)
 
+	redisPool := &redis.Pool{
+		Dial: func() (redis.Conn, error) {
+			return redis.Dial("tcp", envRedisHost)
+		},
+	}
+
 	http.HandleFunc("/test", func(w http.ResponseWriter, r *http.Request) {
 		sc, ok := (&propagation.HTTPFormat{}).SpanContextFromRequest(r)
 		if ok {
 			log.Printf("[INFO] Got span context %v", sc)
 		}
+
 		ctx, span := trace.StartSpanWithRemoteParent(context.Background(), "server", sc)
-		// TODO Add count to span attributes
-		_, err := db.ExecContext(ctx, "select count(*) from test")
+
+		doRedisStaff(ctx, redisPool)
+
+		rows, err := db.QueryContext(ctx, "select count(*) from test")
 		if err != nil {
 			log.Fatalf("db: %v", err)
 		}
+
+		if rows.Next() {
+			var count string
+			err := rows.Scan(&count)
+			if err != nil {
+				log.Fatalf("error during fetch the sql query result: %v", err)
+			}
+			span.AddAttributes(trace.StringAttribute("count result", count))
+			rows.Close()
+		}
+
 		_, spanSleep := trace.StartSpan(ctx, "sleep")
-		time.Sleep(time.Second * 10)
+		time.Sleep(time.Second * 2)
 		spanSleep.End()
 
 		_, err = db.ExecContext(ctx, "insert into test values($1,$2)", 1, "test")
@@ -71,8 +96,41 @@ func main() {
 			log.Fatalf("db: %v", err)
 		}
 		defer span.End()
-		w.WriteHeader(200) // TODO mark result in the span
-		// TODO fail ~ 20% of requests
+
+		if rand.Intn(100) <= 20 {
+			span.SetStatus(trace.Status{Code: 500, Message: "Internal Error"})
+			w.WriteHeader(500)
+			return
+		}
+
+		span.SetStatus(trace.Status{Code: 200, Message: "OK"})
+		w.WriteHeader(200)
 	})
 	http.ListenAndServe(":8080", nil)
+}
+
+func doRedisStaff(ctx context.Context, pool *redis.Pool) {
+	conn := pool.GetWithContext(ctx).(redis.ConnWithContext)
+	defer conn.CloseContext(ctx)
+
+	setCtx, setSpan := trace.StartSpan(ctx, "set in redis")
+	_, err := conn.DoContext(setCtx, "SET", "test", "hello world")
+	if err != nil {
+		log.Fatalf("redis: %v", err)
+	}
+	setSpan.End()
+
+	getCtx, getSpan := trace.StartSpan(ctx, "get from redis")
+	_, err = conn.DoContext(getCtx, "GET", "test")
+	if err != nil {
+		log.Fatalf("redis: %v", err)
+	}
+	getSpan.End()
+
+	delCtx, delSpan := trace.StartSpan(ctx, "delete from redis")
+	_, err = conn.DoContext(delCtx, "DEL", "test")
+	if err != nil {
+		log.Fatalf("redis: %v", err)
+	}
+	delSpan.End()
 }
